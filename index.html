@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+      body {
+        margin: 0;
+        color: inherit;
+      }
+      button,
+      input {
+        box-sizing: border-box;
+        font: inherit;
+      }
+      button {
+        cursor: pointer;
+        margin: 4px 6px 4px 0;
+        padding: 8px 12px;
+      }
+      button:disabled {
+        cursor: wait;
+        opacity: 0.6;
+      }
+      input {
+        max-width: 100%;
+        padding: 6px;
+      }
+      .row {
+        border-top: 1px solid #8885;
+        margin-top: 8px;
+        padding-top: 8px;
+      }
+      .row input {
+        width: 100%;
+      }
+      #status {
+        min-height: 1.4em;
+        overflow-wrap: anywhere;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="login" hidden>
+      <button id="sign-in" type="button" disabled>Sign in with a passkey</button>
+    </div>
+    <div id="manage" hidden>
+      <button id="register" type="button" disabled>Add a passkey</button>
+      <div id="passkeys"></div>
+    </div>
+    <div id="status" role="status" aria-live="polite"></div>
+
+    <script type="module">
+      const status = document.getElementById("status");
+      const loginPanel = document.getElementById("login");
+      const managePanel = document.getElementById("manage");
+      const signInButton = document.getElementById("sign-in");
+      const registerButton = document.getElementById("register");
+      const passkeysPanel = document.getElementById("passkeys");
+      const secureBrowser =
+        window.isSecureContext &&
+        window.PublicKeyCredential &&
+        navigator.credentials;
+      let supabase = null;
+      let clientConfig = "";
+      let sessionConfig = "";
+      let componentArgs = {};
+      let busy = false;
+
+      function send(type, data = {}) {
+        window.parent.postMessage(
+          { isStreamlitMessage: true, type, ...data },
+          "*"
+        );
+      }
+
+      function setHeight() {
+        requestAnimationFrame(() => {
+          send("streamlit:setFrameHeight", {
+            height: document.documentElement.scrollHeight,
+          });
+        });
+      }
+
+      function setStatus(message) {
+        status.textContent = message;
+        setHeight();
+      }
+
+      function publish(action, error, session) {
+        const result = {
+          event_id: crypto.randomUUID(),
+          action,
+          status: error ? "error" : "success",
+        };
+        if (error) {
+          result.message = error.message || String(error);
+        }
+        if (session) {
+          result.session = {
+            access_token: session.access_token,
+            refresh_token: session.refresh_token,
+          };
+        }
+        send("streamlit:setComponentValue", { value: result });
+      }
+
+      function showFailure(action, error) {
+        setStatus(error.message || String(error));
+        publish(action, error);
+      }
+
+      async function initialize(args) {
+        const config = `${args.supabase_url}|${args.anon_key}`;
+        if (!secureBrowser) {
+          throw new Error(
+            "Passkeys require HTTPS and a browser that supports WebAuthn."
+          );
+        }
+        if (!args.supabase_url || !args.anon_key) {
+          throw new Error("Passkey sign-in is not configured.");
+        }
+        if (!supabase || config !== clientConfig) {
+          const { createClient } = await import(
+            "https://esm.sh/@supabase/supabase-js@2.117.3"
+          );
+          supabase = createClient(args.supabase_url, args.anon_key, {
+            auth: {
+              autoRefreshToken: false,
+              detectSessionInUrl: false,
+              persistSession: false,
+            },
+          });
+          clientConfig = config;
+          sessionConfig = "";
+        }
+
+        if (args.mode === "manage") {
+          if (!args.access_token || !args.refresh_token) {
+            throw new Error("Sign in again before managing passkeys.");
+          }
+          const nextSessionConfig = `${args.access_token}|${args.refresh_token}`;
+          if (sessionConfig !== nextSessionConfig) {
+            const { error } = await supabase.auth.setSession({
+              access_token: args.access_token,
+              refresh_token: args.refresh_token,
+            });
+            if (error) {
+              throw error;
+            }
+            sessionConfig = nextSessionConfig;
+          }
+        }
+      }
+
+      function renderPasskeys(passkeys) {
+        passkeysPanel.replaceChildren();
+        if (!passkeys.length) {
+          const empty = document.createElement("p");
+          empty.textContent = "No passkeys are registered for this account.";
+          passkeysPanel.append(empty);
+          setHeight();
+          return;
+        }
+
+        for (const passkey of passkeys) {
+          if (!passkey.id) {
+            continue;
+          }
+          const row = document.createElement("div");
+          row.className = "row";
+          const name = document.createElement("input");
+          name.setAttribute("aria-label", "Passkey name");
+          name.maxLength = 120;
+          name.value = passkey.friendly_name || "My passkey";
+          const rename = document.createElement("button");
+          rename.type = "button";
+          rename.textContent = "Rename";
+          rename.disabled = busy;
+          rename.addEventListener("click", async () => {
+            const friendlyName = name.value.trim();
+            if (!friendlyName) {
+              setStatus("Enter a name for this passkey.");
+              return;
+            }
+            await perform("rename", async () => {
+              const { error } = await supabase.auth.passkey.update({
+                passkeyId: passkey.id,
+                friendlyName,
+              });
+              if (error) {
+                throw error;
+              }
+              await refreshPasskeys();
+            });
+          });
+          const remove = document.createElement("button");
+          remove.type = "button";
+          remove.textContent = "Remove";
+          remove.disabled = busy;
+          remove.addEventListener("click", async () => {
+            await perform("remove", async () => {
+              const { error } = await supabase.auth.passkey.delete({
+                passkeyId: passkey.id,
+              });
+              if (error) {
+                throw error;
+              }
+              await refreshPasskeys();
+            });
+          });
+          row.append(name, rename, remove);
+          passkeysPanel.append(row);
+        }
+        setHeight();
+      }
+
+      async function refreshPasskeys() {
+        const { data, error } = await supabase.auth.passkey.list();
+        if (error) {
+          throw error;
+        }
+        renderPasskeys(Array.isArray(data) ? data : []);
+      }
+
+      async function perform(action, operation) {
+        if (busy) {
+          return;
+        }
+        busy = true;
+        signInButton.disabled = true;
+        registerButton.disabled = true;
+        setStatus("Waiting for your device...");
+        try {
+          const result = await operation();
+          setStatus(
+            action === "sign_in"
+              ? "Passkey accepted. Signing you in..."
+              : "Passkey settings updated."
+          );
+          publish(action, null, result?.session);
+        } catch (error) {
+          showFailure(action, error);
+        } finally {
+          busy = false;
+          signInButton.disabled = componentArgs.mode !== "sign_in";
+          registerButton.disabled = componentArgs.mode !== "manage";
+          setHeight();
+        }
+      }
+
+      signInButton.addEventListener("click", async () => {
+        await perform("sign_in", async () => {
+          const { data, error } = await supabase.auth.signInWithPasskey();
+          if (error) {
+            throw error;
+          }
+          if (!data.session?.access_token || !data.session?.refresh_token) {
+            throw new Error("The passkey provider returned no valid session.");
+          }
+          setStatus("Passkey accepted. Signing you in...");
+          return { session: data.session };
+        });
+      });
+
+      registerButton.addEventListener("click", async () => {
+        await perform("register", async () => {
+          const { error } = await supabase.auth.registerPasskey();
+          if (error) {
+            throw error;
+          }
+          await refreshPasskeys();
+        });
+      });
+
+      async function render(args) {
+        componentArgs = args;
+        const isLogin = args.mode === "sign_in";
+        loginPanel.hidden = !isLogin;
+        managePanel.hidden = isLogin;
+        signInButton.disabled = true;
+        registerButton.disabled = true;
+        if (!secureBrowser) {
+          setStatus("Passkeys require HTTPS and a compatible browser.");
+          return;
+        }
+        try {
+          await initialize(args);
+          if (isLogin) {
+            signInButton.disabled = false;
+            setStatus("Your device may use a fingerprint, face unlock, or device PIN.");
+          } else {
+            registerButton.disabled = false;
+            setStatus("Passkeys are protected by your device or password manager.");
+            await refreshPasskeys();
+          }
+        } catch (error) {
+          setStatus(error.message || String(error));
+        }
+        setHeight();
+      }
+
+      window.addEventListener("message", (event) => {
+        if (
+          event.source === window.parent &&
+          event.data?.type === "streamlit:render"
+        ) {
+          void render(event.data.args || {});
+        }
+      });
+
+      send("streamlit:componentReady", { apiVersion: 1 });
+      setHeight();
+    </script>
+  </body>
+</html>
